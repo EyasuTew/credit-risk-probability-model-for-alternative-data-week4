@@ -8,3 +8,4 @@ joblib
 pytest
 matplotlib
 seaborn
+xgboost
