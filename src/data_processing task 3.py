@@ -1,6 +1,6 @@
-# Updated src/data_processing.py for Task 4: Proxy Target Variable Engineering
-# Builds on Task 3: Adds K-Means clustering on RFM for high-risk proxy (is_high_risk)
-# Integrates into feature engineering pipeline
+# Updated src/data_processing.py for Task 3: Feature Engineering
+# Integrates sklearn Pipeline for reproducible transformations
+# Includes aggregation, time extraction, encoding, imputation, scaling, and custom WoE/IV
 
 import pandas as pd
 import numpy as np
@@ -8,8 +8,7 @@ from datetime import datetime
 from pathlib import Path
 import logging
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
@@ -32,7 +31,7 @@ def parse_timestamps(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_rfm(df: pd.DataFrame, customer_id_col: str = 'CustomerId') -> pd.DataFrame:
     """Calculate RFM for customers (purchases only: Amount > 0)."""
     purchases = df[df['Amount'] > 0].copy()
-    current_time = purchases['TransactionStartTime'].max()  # Snapshot date: last transaction
+    current_time = purchases['TransactionStartTime'].max()
     
     rfm = purchases.groupby(customer_id_col).agg({
         'TransactionStartTime': [
@@ -63,40 +62,15 @@ def rfm_scoring(rfm: pd.DataFrame) -> pd.DataFrame:
     rfm['F_score'] = score_col(rfm['Frequency']).astype(int)
     rfm['M_score'] = score_col(rfm['Monetary']).astype(int)
     rfm['RFM_score'] = rfm['R_score'] + rfm['F_score'] + rfm['M_score']
-    return rfm
-
-def create_high_risk_proxy(rfm: pd.DataFrame) -> pd.DataFrame:
-    """Cluster RFM with K-Means into 3 groups; label high-risk (least engaged)."""
-    # Scale RFM (Recency: higher better? For clustering, scale raw; reverse Recency if needed)
-    rfm_scaled = rfm[['Recency', 'Frequency', 'Monetary']].copy()
-    # Reverse Recency for consistency (lower = better engagement)
-    rfm_scaled['Recency'] = -rfm_scaled['Recency']  # Negative for scaling
-    scaler = StandardScaler()
-    rfm_scaled = scaler.fit_transform(rfm_scaled)
-    rfm_scaled = pd.DataFrame(rfm_scaled, columns=['Recency', 'Frequency', 'Monetary'], index=rfm.index)
     
-    # K-Means clustering (3 clusters, reproducible)
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-    rfm['cluster'] = kmeans.fit_predict(rfm_scaled)
-    
-    # Analyze clusters: High-risk = lowest mean Frequency + Monetary (least engaged)
-    cluster_means = rfm.groupby('cluster')[['Frequency', 'Monetary']].mean()
-    high_risk_cluster = cluster_means['Frequency'].idxmin()  # Or combine: .sum(axis=1).idxmin()
-    logger.info(f"Cluster means:\n{cluster_means}")
-    logger.info(f"High-risk cluster (lowest engagement): {high_risk_cluster}")
-    
-    # Binary label: 1 for high-risk cluster
-    rfm['is_high_risk'] = (rfm['cluster'] == high_risk_cluster).astype(int)
-    
-    # Drop temp cluster
-    rfm = rfm.drop('cluster', axis=1)
-    
+    # Proxy: bad (1) if score < 9
+    rfm['default_proxy'] = (rfm['RFM_score'] < 9).astype(int)
     return rfm
 
 # Custom WoE Transformer (Manual Implementation)
 class WOETransformer(BaseEstimator, TransformerMixin):
     """Apply Weight of Evidence transformation to binned features."""
-    def __init__(self, target_col='is_high_risk', bins=5):
+    def __init__(self, target_col='default_proxy', bins=5):
         self.target_col = target_col
         self.bins = bins
         self.woe_dict = {}
@@ -183,10 +157,9 @@ def engineer_features(df: pd.DataFrame) -> tuple:
     # Parse timestamps first
     df = parse_timestamps(df)
     
-    # RFM and proxy via clustering
+    # RFM and proxy
     rfm = calculate_rfm(df)
     rfm = rfm_scoring(rfm)
-    rfm = create_high_risk_proxy(rfm)  # New: K-Means for is_high_risk
     
     # Additional aggregates
     fraud_rate = df.groupby('CustomerId')['FraudResult'].agg(['mean', 'count']).reset_index()
@@ -233,15 +206,15 @@ def engineer_features(df: pd.DataFrame) -> tuple:
     features['unique_months'] = features['unique_months'].fillna(1)
     features['unique_years'] = features['unique_years'].fillna(1)
     
-    # Correlation/IV check (use is_high_risk as target)
-    numeric_cols = features.select_dtypes(include=[np.number]).columns.drop('is_high_risk')
-    corr_with_target = features[numeric_cols].corrwith(features['is_high_risk']).abs().sort_values(ascending=False)
-    logger.info(f"Top correlated features with is_high_risk:\n{corr_with_target.head()}")
+    # Correlation/IV check
+    numeric_cols = features.select_dtypes(include=[np.number]).columns.drop('default_proxy')
+    corr_with_target = features[numeric_cols].corrwith(features['default_proxy']).abs().sort_values(ascending=False)
+    logger.info(f"Top correlated features:\n{corr_with_target.head()}")
     
     # IV for selection
     selected_features = []
     for feat in numeric_cols:
-        iv = calculate_iv(features, feat, 'is_high_risk')
+        iv = calculate_iv(features, feat, 'default_proxy')
         logger.info(f"IV for {feat}: {iv}")
         if iv > 0.01:  # Lowered threshold for selection
             selected_features.append(feat)
@@ -253,7 +226,7 @@ def engineer_features(df: pd.DataFrame) -> tuple:
     
     return features, selected_features
 
-def apply_transformations(features: pd.DataFrame, selected_features: list, target_col: str = 'is_high_risk'):
+def apply_transformations(features: pd.DataFrame, selected_features: list, target_col: str = 'default_proxy'):
     """Apply imputation, scaling, and WoE via pipeline."""
     # Prepare columns
     X = features[selected_features]
